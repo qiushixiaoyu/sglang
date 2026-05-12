@@ -42,6 +42,7 @@ from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_cp_size,
@@ -1086,7 +1087,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
 
 def enable_num_token_non_padded():
-    return get_moe_expert_parallel_world_size() > 1
+    return (
+        get_moe_expert_parallel_world_size() > 1
+        or envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
+    )
 
 
 class PPProxyTensors:
