@@ -26,6 +26,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.mega_moe_sm90 import (
+    is_sm90_fp4_mega_moe_available,
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
 )
@@ -105,7 +106,12 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
     if _device_sm == 90:
-        if not is_sm90_fp8_mega_moe_available(moe.experts):
+        # SM90 has two mega-MoE recipes: FP8 weights (fp8_mega_moe) and packed
+        # FP4 weights (fp8_fp4_mega_moe). Either one being ready is enough.
+        if not (
+            is_sm90_fp8_mega_moe_available(moe.experts)
+            or is_sm90_fp4_mega_moe_available(moe.experts)
+        ):
             return False
     if get_is_capture_mode():
         return True
@@ -116,7 +122,22 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return max_tokens_per_rank <= cap
+    if max_tokens_per_rank > cap:
+        if getattr(moe.experts, "_mega_moe_sm90_fp4_weights", False):
+            # SM90/Hopper has no non-MegaMOE FP4 GEMM to fall back to: deep_gemm's
+            # FP4 support on SM90 lives only in the mega kernel, and
+            # `transform_sf_into_required_layout(recipe=(1, 32))` is unsupported on
+            # SM90. (In memory-fix mode the checkpoint FP4 layout is additionally
+            # overwritten.) So over-cap requests cannot degrade to the non-mega
+            # path in either mode — fail loudly instead of silently miscomputing.
+            raise RuntimeError(
+                "SM90 FP4 MegaMOE has no non-MegaMOE fallback path on Hopper. "
+                f"max_tokens_per_rank={max_tokens_per_rank} exceeds "
+                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
+                f"{cap}; raise the env var or reduce chunked/cuda-graph batch size."
+            )
+        return False
+    return True
 
 
 def forward_mega_moe(

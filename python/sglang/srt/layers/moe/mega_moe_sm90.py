@@ -42,6 +42,20 @@ def is_sm90_fp8_mega_moe_available(experts) -> bool:
     )
 
 
+def is_sm90_fp4_mega_moe_available(experts) -> bool:
+    if _device_sm != 90:
+        return False
+    try:
+        import deep_gemm
+    except ImportError:
+        return False
+    return (
+        hasattr(deep_gemm, "fp8_fp4_mega_moe")
+        and hasattr(deep_gemm, "mega_moe_pre_dispatch_sm90")
+        and getattr(experts, "_mega_moe_sm90_fp4_weights", False)
+    )
+
+
 def run_sm90_mega_routed(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
@@ -51,6 +65,23 @@ def run_sm90_mega_routed(
     num_tokens: int,
 ) -> torch.Tensor:
     import deep_gemm
+
+    # SM90 supports two weight recipes behind the same pre-dispatch:
+    #   * FP8 weights  -> fp8_mega_moe        (per-128 FP32 SF)
+    #   * packed FP4   -> fp8_fp4_mega_moe    (per-32 UE8M0 SFB, in-kernel decode)
+    use_fp4 = getattr(moe.experts, "_mega_moe_sm90_fp4_weights", False)
+
+    # Both SM90 paths feed FP8 activations with per-128 FP32 SF via
+    # `mega_moe_pre_dispatch_sm90`. Enabling FP4 *activations* would allocate
+    # buf.x as int8 (packed FP4) with a per-32 SF layout the SM90 kernels cannot
+    # consume; the byte sizes can coincidentally match but the GEMM would read
+    # the wrong scales and silently produce wrong results. Reject the combination.
+    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get():
+        raise RuntimeError(
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS is incompatible with the "
+            "SM90 mega-MoE paths (FP8 weights or FP4 weights). SM90 only supports "
+            "FP8 activations with per-128 SF. Disable the flag or run on SM100."
+        )
 
     if moe.experts.should_fuse_routed_scaling_factor_in_topk:
         routed_scaling_factor = 1.0
@@ -75,16 +106,29 @@ def run_sm90_mega_routed(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    deep_gemm.fp8_mega_moe(
-        y,
-        moe.experts.mega_l1_weights,
-        moe.experts.mega_l2_weights,
-        buf,
-        recipe=(128, 128, 128),
-        activation="swiglu",
-        activation_clamp=getattr(moe.config, "swiglu_limit", None),
-        fast_math=True,
-    )
+    swiglu_limit = getattr(moe.config, "swiglu_limit", None)
+    if use_fp4:
+        deep_gemm.fp8_fp4_mega_moe(
+            y,
+            moe.experts.mega_l1_weights,
+            moe.experts.mega_l2_weights,
+            buf,
+            recipe=(1, 1, 32),
+            activation="swiglu",
+            activation_clamp=swiglu_limit,
+            fast_math=True,
+        )
+    else:
+        deep_gemm.fp8_mega_moe(
+            y,
+            moe.experts.mega_l1_weights,
+            moe.experts.mega_l2_weights,
+            buf,
+            recipe=(128, 128, 128),
+            activation="swiglu",
+            activation_clamp=swiglu_limit,
+            fast_math=True,
+        )
     y = y[:num_tokens]
 
     return y
@@ -176,4 +220,54 @@ def build_sm90_mega_moe_experts_weights(experts) -> None:
         experts.mega_l2_weights = l2_pair
 
     experts._mega_moe_sm90_fp8_weights = True
+    experts._mega_moe_weights_built = True
+
+
+def build_sm90_fp4_mega_moe_experts_weights(experts) -> None:
+    if getattr(experts, "_mega_moe_weights_built", False):
+        return
+
+    from deep_gemm import transform_weights_for_mega_moe_sm90_fp4
+
+    w13 = experts.w13_weight.data
+    w13_sf_fp32 = experts.w13_weight_scale_inv.data
+    w2 = experts.w2_weight.data
+    w2_sf_fp32 = experts.w2_weight_scale_inv.data
+
+    # SM90 FP4 weights ship as packed E2M1 (two nibbles per byte stored as
+    # int8/uint8, last dim K//2) with raw per-32 FP32 SFB. The DeepGEMM helper
+    # packs them into the interleaved FP4 + k-major UE8M0 layout the SM90 kernel
+    # ldgs directly; no `transform_sf_into_required_layout` step is needed.
+    assert w13.dtype in (torch.int8, torch.uint8)
+    assert w2.dtype in (torch.int8, torch.uint8)
+
+    l1_pair, l2_pair = transform_weights_for_mega_moe_sm90_fp4(
+        (w13, w13_sf_fp32), (w2, w2_sf_fp32)
+    )
+
+    if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        # Replace the checkpoint-layout params with the MegaMOE layout so the
+        # originals can be released before KV-pool sizing. This drops the
+        # non-MegaMOE fallback path for this layer (see should_use_mega_moe,
+        # which raises instead of falling back once this flag is set).
+        experts.w13_weight.data = l1_pair[0]
+        experts.w2_weight.data = l2_pair[0]
+        experts.w13_weight_scale_inv.data = l1_pair[1]
+        experts.w2_weight_scale_inv.data = l2_pair[1]
+        experts.w13_weight_scale_inv.format_ue8m0 = True
+        experts.w2_weight_scale_inv.format_ue8m0 = True
+
+        experts.mega_l1_weights = (
+            experts.w13_weight.data,
+            experts.w13_weight_scale_inv.data,
+        )
+        experts.mega_l2_weights = (
+            experts.w2_weight.data,
+            experts.w2_weight_scale_inv.data,
+        )
+    else:
+        experts.mega_l1_weights = l1_pair
+        experts.mega_l2_weights = l2_pair
+
+    experts._mega_moe_sm90_fp4_weights = True
     experts._mega_moe_weights_built = True

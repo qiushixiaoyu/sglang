@@ -1332,11 +1332,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
 
                 if get_moe_a2a_backend().is_megamoe():
-                    from sglang.srt.layers.moe.mega_moe import (
-                        build_mega_moe_experts_weights,
-                    )
+                    if is_sm90_supported():
+                        # SM90 decodes packed FP4 weights in-kernel and needs a
+                        # dedicated weight transform (see mega_moe_sm90).
+                        from sglang.srt.layers.moe.mega_moe_sm90 import (
+                            build_sm90_fp4_mega_moe_experts_weights,
+                        )
 
-                    build_mega_moe_experts_weights(layer)
+                        build_sm90_fp4_mega_moe_experts_weights(layer)
+                    else:
+                        from sglang.srt.layers.moe.mega_moe import (
+                            build_mega_moe_experts_weights,
+                        )
+
+                        build_mega_moe_experts_weights(layer)
                     return
 
                 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and will_use_deepgemm:
