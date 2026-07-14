@@ -57,6 +57,12 @@ def _apply_mega_moe_dg_env() -> None:
     global _MEGA_MOE_DG_ENV_APPLIED
     if _MEGA_MOE_DG_ENV_APPLIED:
         return
+    # 对称内存默认 CUDA(IPC) 后端仅单机有效，多节点 EP 会在 rendezvous 时 "Failed to send fd"。
+    # 切到 NVSHMEM 后端（跨节点可用；本环境 is_nvshmem_available()=True）。
+    import torch.distributed._symmetric_memory as _symm_mem
+
+    if _symm_mem.is_nvshmem_available():
+        _symm_mem.set_backend("NVSHMEM")
     if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get():
         os.environ.setdefault("DG_USE_FP4_ACTS", "1")
     if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND.get():
