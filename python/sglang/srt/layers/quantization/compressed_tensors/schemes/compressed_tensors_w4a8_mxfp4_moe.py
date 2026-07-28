@@ -239,12 +239,13 @@ class CompressedTensorsW4A8Mxfp4MoE(CompressedTensorsMoEScheme):
         self._build_mega_moe_weights(layer)
 
     def _build_mega_moe_weights(self, layer: torch.nn.Module) -> None:
-        """Hand the weights to the architecture-specific DeepGEMM transform.
+        """Hand the weights to DeepGEMM's mega-MoE transform.
 
         Must run after every in-place weight rewrite and instead of (not before)
         any scale re-layout -- the transform consumes checkpoint-layout per-32
         fp32 scales and does the UE8M0 packing itself.
         """
+        from sglang.srt.layers.moe.mega_moe import build_mega_moe_experts_weights
         from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
         backend = get_moe_a2a_backend()
@@ -256,18 +257,7 @@ class CompressedTensorsW4A8Mxfp4MoE(CompressedTensorsMoEScheme):
                 "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1 to have it auto-configured."
             )
 
-        if is_sm90_supported():
-            from sglang.srt.layers.moe.mega_moe_sm90 import (
-                build_sm90_fp4_mega_moe_experts_weights,
-            )
-
-            build_sm90_fp4_mega_moe_experts_weights(layer)
-        else:
-            from sglang.srt.layers.moe.mega_moe import (
-                build_mega_moe_experts_weights,
-            )
-
-            build_mega_moe_experts_weights(layer)
+        build_mega_moe_experts_weights(layer)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
