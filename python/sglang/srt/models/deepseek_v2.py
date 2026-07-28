@@ -2642,15 +2642,8 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
-    # Quantization configs (quark, compressed-tensors) unfuse these names back to
-    # the checkpoint's layer names when matching ignore/target patterns.
-    # DeepseekV2MLP always merges gate_proj/up_proj into one linear, so a config
-    # that excludes them by exact name -- e.g. GLM-5.2 MXFP4's
-    # `re:.*\.mlp\.(up_proj|gate_proj|down_proj)$` -- would otherwise miss the
-    # fused layer and try to quantize a BF16 one.
-    packed_modules_mapping = {
-        "gate_up_proj": ["gate_proj", "up_proj"],
-    }
+    # for quark model load
+    packed_modules_mapping = {}
 
     def __init__(
         self,
