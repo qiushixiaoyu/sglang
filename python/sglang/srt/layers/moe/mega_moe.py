@@ -71,6 +71,7 @@ def _get_mega_moe_symm_buffer(
     num_topk: int,
     hidden: int,
     intermediate_hidden: int,
+    activation: str = "swiglu",
 ) -> SymmBuffer:
     import deep_gemm
 
@@ -83,6 +84,7 @@ def _get_mega_moe_symm_buffer(
         num_topk,
         hidden,
         intermediate_hidden,
+        activation,
     )
     buf = _MEGA_MOE_SYMM_BUFFER.get(key)
     if buf is None:
@@ -94,7 +96,7 @@ def _get_mega_moe_symm_buffer(
             hidden,
             intermediate_hidden,
             use_fp8_dispatch=True,
-            activation="swiglu",
+            activation=activation,
         )
         _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
@@ -216,6 +218,9 @@ def _run_mega_routed(
     num_experts = moe.experts.num_experts
     top_k = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
     intermediate_size = moe.config.moe_intermediate_size
+    mega_activation = (
+        "situ" if getattr(moe.config, "hidden_act", None) == "situ" else "swiglu"
+    )
     num_max_tokens_per_rank = (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     )
@@ -233,6 +238,7 @@ def _run_mega_routed(
         num_topk=top_k,
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
+        activation=mega_activation,
     )
 
     if num_tokens > 0:

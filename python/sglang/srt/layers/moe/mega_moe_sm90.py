@@ -70,9 +70,15 @@ def run_sm90_mega_routed(
     #   * FP8 weights  -> fp8_mega_moe        (per-128 FP32 SF)
     #   * packed FP4   -> fp8_fp4_mega_moe    (per-32 UE8M0 SFB, in-kernel decode)
     use_fp4 = getattr(moe.experts, "_mega_moe_sm90_fp4_weights", False)
+    activation = (
+        "situ" if getattr(moe.config, "hidden_act", None) == "situ" else "swiglu"
+    )
+    if activation == "situ" and not use_fp4:
+        raise RuntimeError("SM90 MegaMoE SiTU is currently supported only with FP4 weights")
 
-    # Both SM90 paths feed FP8 activations with per-128 FP32 SF via
-    # `mega_moe_pre_dispatch_sm90`. Enabling FP4 *activations* would allocate
+    # Both SM90 paths feed FP8 activations with FP32 SF via
+    # `mega_moe_pre_dispatch_sm90` (SwiGLU uses group 128, SiTU uses group 32).
+    # Enabling FP4 *activations* would allocate
     # buf.x as int8 (packed FP4) with a per-32 SF layout the SM90 kernels cannot
     # consume; the byte sizes can coincidentally match but the GEMM would read
     # the wrong scales and silently produce wrong results. Reject the combination.
@@ -80,7 +86,7 @@ def run_sm90_mega_routed(
         raise RuntimeError(
             "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS is incompatible with the "
             "SM90 mega-MoE paths (FP8 weights or FP4 weights). SM90 only supports "
-            "FP8 activations with per-128 SF. Disable the flag or run on SM100."
+            "FP8 activations with FP32 SF. Disable the flag or run on SM100."
         )
 
     if moe.experts.should_fuse_routed_scaling_factor_in_topk:
@@ -97,7 +103,7 @@ def run_sm90_mega_routed(
         buf.topk_idx,
         buf.topk_weights,
         num_tokens=num_tokens,
-        group_size=128,
+        group_size=32 if activation == "situ" else 128,
         routed_scaling_factor=routed_scaling_factor,
     )
 
@@ -108,14 +114,22 @@ def run_sm90_mega_routed(
     )
     swiglu_limit = getattr(moe.config, "swiglu_limit", None)
     if use_fp4:
+        activation_alpha = getattr(
+            moe.config, "activation_situ_beta", None
+        )
+        activation_linear_beta = getattr(
+            moe.config, "activation_situ_linear_beta", None
+        )
         deep_gemm.fp8_fp4_mega_moe(
             y,
             moe.experts.mega_l1_weights,
             moe.experts.mega_l2_weights,
             buf,
             recipe=(1, 1, 32),
-            activation="swiglu",
-            activation_clamp=swiglu_limit,
+            activation=activation,
+            activation_clamp=swiglu_limit if activation == "swiglu" else None,
+            activation_alpha=activation_alpha,
+            activation_linear_beta=activation_linear_beta,
             fast_math=True,
         )
     else:
