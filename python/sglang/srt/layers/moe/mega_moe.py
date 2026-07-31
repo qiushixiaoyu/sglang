@@ -26,8 +26,14 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.moe.mega_moe_sm90 import (
+    is_sm90_fp4_mega_moe_available,
+    is_sm90_fp8_mega_moe_available,
+    run_sm90_mega_routed,
+)
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.models.deepseek_common.utils import _device_sm
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -66,6 +72,7 @@ def _get_mega_moe_symm_buffer(
     num_topk: int,
     hidden: int,
     intermediate_hidden: int,
+    activation: str = "swiglu",
 ) -> SymmBuffer:
     import deep_gemm
 
@@ -78,6 +85,7 @@ def _get_mega_moe_symm_buffer(
         num_topk,
         hidden,
         intermediate_hidden,
+        activation,
     )
     buf = _MEGA_MOE_SYMM_BUFFER.get(key)
     if buf is None:
@@ -89,7 +97,7 @@ def _get_mega_moe_symm_buffer(
             hidden,
             intermediate_hidden,
             use_fp8_dispatch=True,
-            activation="swiglu",
+            activation=activation,
         )
         _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
@@ -100,6 +108,14 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
+    if _device_sm == 90:
+        # SM90 has two mega-MoE recipes: FP8 weights (fp8_mega_moe) and packed
+        # FP4 weights (fp8_fp4_mega_moe). Either one being ready is enough.
+        if not (
+            is_sm90_fp8_mega_moe_available(moe.experts)
+            or is_sm90_fp4_mega_moe_available(moe.experts)
+        ):
+            return False
     if get_is_capture_mode():
         return True
 
@@ -109,7 +125,22 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return max_tokens_per_rank <= cap
+    if max_tokens_per_rank > cap:
+        if getattr(moe.experts, "_mega_moe_sm90_fp4_weights", False):
+            # SM90/Hopper has no non-MegaMOE FP4 GEMM to fall back to: deep_gemm's
+            # FP4 support on SM90 lives only in the mega kernel, and
+            # `transform_sf_into_required_layout(recipe=(1, 32))` is unsupported on
+            # SM90. (In memory-fix mode the checkpoint FP4 layout is additionally
+            # overwritten.) So over-cap requests cannot degrade to the non-mega
+            # path in either mode — fail loudly instead of silently miscomputing.
+            raise RuntimeError(
+                "SM90 FP4 MegaMOE has no non-MegaMOE fallback path on Hopper. "
+                f"max_tokens_per_rank={max_tokens_per_rank} exceeds "
+                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
+                f"{cap}; raise the env var or reduce chunked/cuda-graph batch size."
+            )
+        return False
+    return True
 
 
 def forward_mega_moe(
@@ -188,6 +219,9 @@ def _run_mega_routed(
     num_experts = moe.experts.num_experts
     top_k = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
     intermediate_size = moe.config.moe_intermediate_size
+    mega_activation = (
+        "situ" if getattr(moe.config, "hidden_act", None) == "situ" else "swiglu"
+    )
     num_max_tokens_per_rank = (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     )
@@ -205,6 +239,7 @@ def _run_mega_routed(
         num_topk=top_k,
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
+        activation=mega_activation,
     )
 
     if num_tokens > 0:
@@ -213,6 +248,16 @@ def _run_mega_routed(
     else:
         topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
+
+    if _device_sm == 90:
+        return run_sm90_mega_routed(
+            moe,
+            hidden_states,
+            topk_ids_in,
+            topk_weights_in,
+            buf,
+            num_tokens,
+        )
 
     use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
     if use_fp4_acts:

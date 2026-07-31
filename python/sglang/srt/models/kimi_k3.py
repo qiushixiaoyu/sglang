@@ -382,6 +382,8 @@ class KimiK3MoE(nn.Module):
         self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.num_shared_experts = config.num_shared_experts
+        self._situ_beta = config.activation_situ_beta
+        self._situ_linear_beta = config.activation_situ_linear_beta
         self.layer_idx = layer_idx
         self.alt_stream = alt_stream
         self._dp_attention = is_dp_attention_enabled()
@@ -404,9 +406,20 @@ class KimiK3MoE(nn.Module):
         self.gate = MoEGate(config, quant_config=None, prefix=f"{prefix}.gate")
 
         # For MXFP4 compressed-tensors, replace quant_config with Mxfp4Config
-        # so FusedMoE's weight_loader uses the MXFP4 fast path
+        # so FusedMoE's weight_loader uses the MXFP4 fast path. On SM90 keep
+        # the compressed-tensors config: CompressedTensorsW4A8Mxfp4MoE loads
+        # the packed weights and builds the DeepGEMM SM90 MegaMoE views.
+        from sglang.srt.utils import is_sm90_supported
+
         moe_quant_config = quant_config
-        if quant_config is not None and getattr(quant_config, "quant_format", None):
+        use_sm90_mega_moe = (
+            is_sm90_supported() and get_moe_a2a_backend().is_megamoe()
+        )
+        if (
+            quant_config is not None
+            and getattr(quant_config, "quant_format", None)
+            and not use_sm90_mega_moe
+        ):
             if "mxfp4" in quant_config.quant_format:
                 from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 
@@ -683,6 +696,10 @@ class KimiK3MoE(nn.Module):
         from sglang.srt.distributed.parallel_state import get_moe_ep_group
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import _get_mega_moe_symm_buffer
+        from sglang.srt.utils import is_sm90_supported
+
+        if is_sm90_supported():
+            return self._forward_mega_experts_sm90(routed_input, topk_output)
 
         # In SP-MoE mode (KimiK3DecoderLayer reduce-scatters the o_proj
         # output) the incoming rows are already this rank's token shard, so
@@ -746,6 +763,92 @@ class KimiK3MoE(nn.Module):
             # (beta=4.0 / linear_beta=25.0 baked in); see
             # p0-wideep/scripts/v2/apply_deepgemm_situ_patch.py
             activation_clamp=_K3_MEGA_SITU_SENTINEL_CLAMP,
+            fast_math=True,
+        )
+        y = y[:num_tokens]
+        if not self.experts.should_fuse_routed_scaling_factor_in_topk:
+            if (
+                self.routed_scaling_factor is not None
+                and self.routed_scaling_factor != 1.0
+            ):
+                y.mul_(self.routed_scaling_factor)
+        return y
+
+    def _forward_mega_experts_sm90(
+        self, routed_input: torch.Tensor, topk_output
+    ) -> torch.Tensor:
+        """SM90 (Hopper) variant of _forward_mega_experts, driving this
+        branch's DeepGEMM SM90 FP4 MegaMoE: the SM90 pre-dispatch takes FP8
+        activations with FP32 SF (the jit pre_dispatch above writes the SM100
+        packed-int32 SF layout), the symmetric buffer carries the SiTU SF
+        layout, and the kernel takes the explicit SiTU interface instead of
+        the activation_clamp sentinel."""
+        import deep_gemm
+
+        from sglang.srt.distributed.parallel_state import get_moe_ep_group
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.mega_moe import _get_mega_moe_symm_buffer
+        from sglang.srt.layers.moe.mega_moe_sm90 import situ_input_sf_group
+
+        num_tokens = routed_input.shape[0]
+        num_max_tokens_per_rank = (
+            envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        )
+        assert num_tokens <= num_max_tokens_per_rank, (
+            f"mega MoE: num_tokens={num_tokens} exceeds "
+            f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
+            f"{num_max_tokens_per_rank}; K3 has no non-mega fallback — raise "
+            f"the env var to cover the per-rank rows"
+        )
+        buf = _get_mega_moe_symm_buffer(
+            get_moe_ep_group().device_group,
+            num_experts=self.experts.num_experts,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            num_topk=self._mega_top_k,
+            hidden=self.moe_hidden_size,
+            intermediate_hidden=self._mega_intermediate_size,
+            activation="situ",
+        )
+
+        if num_tokens > 0:
+            topk_ids_in = topk_output.topk_ids.to(torch.int32)
+            topk_weights_in = topk_output.topk_weights.to(torch.float32)
+        else:
+            topk_ids_in = routed_input.new_empty(
+                (0, self._mega_top_k), dtype=torch.int32
+            )
+            topk_weights_in = routed_input.new_empty(
+                (0, self._mega_top_k), dtype=torch.float32
+            )
+
+        # routed scaling stays the post-multiply below, as in the SM100 path.
+        deep_gemm.mega_moe_pre_dispatch_sm90(
+            routed_input,
+            topk_ids_in,
+            topk_weights_in,
+            buf.x,
+            buf.x_sf,
+            buf.topk_idx,
+            buf.topk_weights,
+            num_tokens=num_tokens,
+            group_size=situ_input_sf_group(),
+            routed_scaling_factor=1.0,
+        )
+        # At least one row so the tvm-ffi binding sees a non-null data_ptr.
+        y = torch.empty(
+            (max(num_tokens, 1), self.moe_hidden_size),
+            dtype=torch.bfloat16,
+            device=routed_input.device,
+        )
+        deep_gemm.fp8_fp4_mega_moe(
+            y,
+            self.experts.mega_l1_weights,
+            self.experts.mega_l2_weights,
+            buf,
+            recipe=(1, 1, 32),
+            activation="situ",
+            activation_alpha=self._situ_beta,
+            activation_linear_beta=self._situ_linear_beta,
             fast_math=True,
         )
         y = y[:num_tokens]
@@ -2773,6 +2876,9 @@ class KimiK3LinearForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        uses_packed_mxfp4_experts = any(
+            name.endswith(".experts.w13_weight_packed") for name in params_dict
+        )
 
         num_hidden_layers = self.config.num_hidden_layers
         for args in weights:
@@ -2793,8 +2899,15 @@ class KimiK3LinearForCausalLM(nn.Module):
                 if _lid.isdigit() and int(_lid) >= num_hidden_layers:
                     continue
 
-            # compressed-tensors MXFP4 stores as weight_packed; Mxfp4MoEMethod uses weight
-            if "weight_packed" in name:
+            # Mxfp4MoEMethod registers unpacked expert parameter names, while
+            # the SM90 compressed-tensors scheme keeps the checkpoint's
+            # weight_packed names until its post-load DeepGEMM transform.
+            is_packed_mxfp4_expert = (
+                uses_packed_mxfp4_experts
+                and ".mlp.experts." in name
+                and "weight_packed" in name
+            )
+            if "weight_packed" in name and not is_packed_mxfp4_expert:
                 name = name.replace("weight_packed", "weight")
 
             # MLA: fuse q_a_proj + kv_a_proj_with_mqa → fused_qkv_a_proj_with_mqa

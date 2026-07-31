@@ -30,7 +30,11 @@ from compressed_tensors.quantization import (
 )
 from pydantic import BaseModel
 
-from sglang.srt.layers.moe import MoeRunnerConfig, get_moe_runner_backend
+from sglang.srt.layers.moe import (
+    MoeRunnerConfig,
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -44,6 +48,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
+    CompressedTensorsW4A8Mxfp4MoE,
     CompressedTensorsW4AFP8MoE,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
@@ -58,6 +63,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW8A8Int8DynamicMoE,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    MXFP4_PACK_QUANTIZED_FORMAT,
     find_matched_target,
     is_activation_quantization_format,
     should_ignore_layer,
@@ -181,7 +187,15 @@ class CompressedTensorsConfig(QuantizationConfig):
             # Detect MXFP4 before the scheme-based path: MXFP4 uses a
             # dedicated FusedMoEMethodBase (Mxfp4MoEMethod) that already
             # handles all MoE backends, bypassing the scheme abstraction.
-            if self._is_mxfp4_moe(layer_name=prefix):
+            # Only SM90 MegaMoE goes through get_moe_scheme below to
+            # CompressedTensorsW4A8Mxfp4MoE; other SM90 backends retain the
+            # official Mxfp4MoEMethod (including its FlashInfer/CUTLASS path).
+            from sglang.srt.utils import is_sm90_supported
+
+            use_sm90_mega_moe = (
+                is_sm90_supported() and get_moe_a2a_backend().is_megamoe()
+            )
+            if self._is_mxfp4_moe(layer_name=prefix) and not use_sm90_mega_moe:
                 from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
                 logger.info_once(
@@ -542,6 +556,40 @@ class CompressedTensorsConfig(QuantizationConfig):
             and is_symmetric
         )
 
+    def _is_mxfp4a8_fp8(
+        self,
+        weight_quant: QuantizationArgs,
+        input_quant: QuantizationArgs,
+        quant_format: Optional[str] = None,
+    ) -> bool:
+        """Detect MXFP4 W4A8: packed E2M1 weights with per-32 E8M0 scales, with
+        dynamic 8-bit float activations declared (GLM-5.2) or no activation
+        quant declared at all (Kimi-K3 weight-only checkpoints). The runtime
+        activation handling is identical either way -- dynamic FP8 quant happens
+        inside the kernel -- so both spellings select this scheme."""
+        if weight_quant is None:
+            return False
+
+        # MXFP4_PACK_QUANTIZED_FORMAT is None on compressed-tensors < 0.13, where
+        # the format cannot occur anyway -- the comparison then never matches.
+        quant_format = quant_format if quant_format is not None else self.quant_format
+        weight_ok = (
+            quant_format == MXFP4_PACK_QUANTIZED_FORMAT
+            and weight_quant.num_bits == 4
+            and weight_quant.type == QuantizationType.FLOAT
+            and weight_quant.strategy == QuantizationStrategy.GROUP.value
+            and weight_quant.group_size == 32
+            and weight_quant.symmetric
+            and not weight_quant.dynamic
+        )
+        if not weight_ok:
+            return False
+        return input_quant is None or (
+            input_quant.num_bits == 8
+            and input_quant.type == QuantizationType.FLOAT
+            and input_quant.dynamic
+        )
+
     def _is_wNa16_group_channel(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
@@ -752,8 +800,23 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         weight_quant = scheme_dict.get("weights")
         input_quant = scheme_dict.get("input_activations")
+        scheme_format = scheme_dict.get("format")
 
-        if self._is_wNa16_group_channel(weight_quant, input_quant):
+        if self._is_mxfp4a8_fp8(weight_quant, input_quant, scheme_format):
+            # Must precede _is_wNa16_group_channel (no dtype check there: a
+            # weight-only float4 group checkpoint would fall into the Marlin
+            # INT4 path) and _is_dynamic_token_w4a8 (per-token FP8 activations
+            # also satisfy that predicate).
+            logger.info_once("Using CompressedTensorsW4A8Mxfp4MoE")
+            return CompressedTensorsW4A8Mxfp4MoE(
+                self,
+                weight_quant,
+                input_quant,
+                quant_format=(
+                    scheme_format if scheme_format is not None else self.quant_format
+                ),
+            )
+        elif self._is_wNa16_group_channel(weight_quant, input_quant):
             if not _is_npu:
                 if (
                     self._is_mxint4a16(weight_quant, input_quant)
