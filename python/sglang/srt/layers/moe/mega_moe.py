@@ -26,6 +26,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.mega_moe_sm90 import (
+    get_sm90_fused_shared_weights,
     is_sm90_fp4_mega_moe_available,
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
@@ -153,15 +154,20 @@ def forward_mega_moe(
     input_ids_global: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
+    fused_shared_weights = get_sm90_fused_shared_weights(moe, num_tokens)
 
     sbo_overlap_flag = (
-        moe.alt_stream is not None
+        fused_shared_weights is None
+        and moe.alt_stream is not None
         and moe.num_fused_shared_experts == 0
         and num_tokens > 0
         and get_is_capture_mode()
     )
 
-    if sbo_overlap_flag:
+    if fused_shared_weights is not None:
+        shared_output = None
+        mega_stream_ctx = nullcontext()
+    elif sbo_overlap_flag:
         current_stream = torch.cuda.current_stream()
         moe.alt_stream.wait_stream(current_stream)
         shared_output = moe._forward_shared_experts(hidden_states)
@@ -172,7 +178,12 @@ def forward_mega_moe(
 
     with mega_stream_ctx:
         y = _run_mega_routed(
-            moe, hidden_states, forward_batch, input_ids_global, num_tokens
+            moe,
+            hidden_states,
+            forward_batch,
+            input_ids_global,
+            num_tokens,
+            fused_shared_weights,
         )
 
     if sbo_overlap_flag:
@@ -189,6 +200,7 @@ def _run_mega_routed(
     forward_batch: Optional[ForwardBatch],
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
+    fused_shared_weights: Optional[tuple] = None,
 ) -> torch.Tensor:
     import deep_gemm
 
@@ -256,6 +268,7 @@ def _run_mega_routed(
             topk_weights_in,
             buf,
             num_tokens,
+            fused_shared_weights,
         )
 
     use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()

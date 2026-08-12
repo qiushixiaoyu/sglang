@@ -15,7 +15,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import os
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -56,6 +57,86 @@ def is_sm90_fp4_mega_moe_available(experts) -> bool:
     )
 
 
+def get_sm90_fused_shared_weights(
+    moe: DeepseekV2MoE,
+    num_tokens: int,
+) -> Optional[tuple]:
+    """Return cached transformed weights for the decode shared phase.
+
+    This path is deliberately opt-in while its accuracy/performance envelope
+    is being validated.  Unsupported shapes and weight formats fall back to
+    the existing standalone shared MLP without changing routed MegaMoE.
+    """
+    if os.getenv("SGLANG_MEGA_MOE_FUSE_SHARED_EXPERT", "0") != "1":
+        return None
+    max_tokens = int(os.getenv("SGLANG_MEGA_MOE_FUSE_SHARED_MAX_TOKENS", "64"))
+    if (
+        _device_sm != 90
+        or num_tokens <= 0
+        or num_tokens > max_tokens
+        or getattr(moe.config, "n_shared_experts", 0) != 1
+        or moe.num_fused_shared_experts != 0
+        or not hasattr(moe, "shared_experts")
+        or not getattr(moe, "_shared_expert_tp1", False)
+        or not getattr(moe, "shared_experts_is_fp8", False)
+        or getattr(moe.experts, "_mega_moe_sm90_fp4_weights", False)
+        or not getattr(moe.experts, "_mega_moe_sm90_fp8_weights", False)
+    ):
+        return None
+
+    import deep_gemm
+
+    if not hasattr(deep_gemm, "fp8_mega_moe_with_shared"):
+        return None
+    cached = getattr(moe, "_mega_moe_sm90_shared_weights", None)
+    if cached is not None:
+        return cached
+    if torch.cuda.is_current_stream_capturing():
+        return None
+
+    shared = moe.shared_experts
+    w13 = shared.gate_up_proj.weight.data
+    w2 = shared.down_proj.weight.data
+    w13_sf_raw = shared.gate_up_proj.weight_scale_inv.data
+    w2_sf_raw = shared.down_proj.weight_scale_inv.data
+    if w13.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
+        return None
+
+    # Shared TP1 linears are 2-D; give the existing MegaMoE transform a
+    # singleton expert dimension so their layout exactly matches routed FP8.
+    w13_grouped = w13.unsqueeze(0)
+    w2_grouped = w2.unsqueeze(0)
+    w13_sf_grouped = (
+        w13_sf_raw.unsqueeze(0) if w13_sf_raw.ndim == 2 else w13_sf_raw
+    )
+    w2_sf_grouped = (
+        w2_sf_raw.unsqueeze(0) if w2_sf_raw.ndim == 2 else w2_sf_raw
+    )
+    _, n1, k1 = w13_grouped.shape
+    _, n2, k2 = w2_grouped.shape
+    w13_sf = deep_gemm.transform_sf_into_required_layout(
+        w13_sf_grouped,
+        mn=n1,
+        k=k1,
+        recipe=(128, 128),
+        num_groups=1,
+        disable_ue8m0_cast=True,
+    )
+    w2_sf = deep_gemm.transform_sf_into_required_layout(
+        w2_sf_grouped,
+        mn=n2,
+        k=k2,
+        recipe=(128, 128),
+        num_groups=1,
+        disable_ue8m0_cast=True,
+    )
+    cached = deep_gemm.transform_weights_for_mega_moe_sm90(
+        (w13_grouped, w13_sf), (w2_grouped, w2_sf)
+    )
+    moe._mega_moe_sm90_shared_weights = cached
+    return cached
+
+
 def run_sm90_mega_routed(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
@@ -63,6 +144,7 @@ def run_sm90_mega_routed(
     topk_weights: torch.Tensor,
     buf: SymmBuffer,
     num_tokens: int,
+    shared_weights: Optional[tuple] = None,
 ) -> torch.Tensor:
     import deep_gemm
 
@@ -108,12 +190,27 @@ def run_sm90_mega_routed(
     )
     swiglu_limit = getattr(moe.config, "swiglu_limit", None)
     if use_fp4:
+        assert shared_weights is None
         deep_gemm.fp8_fp4_mega_moe(
             y,
             moe.experts.mega_l1_weights,
             moe.experts.mega_l2_weights,
             buf,
             recipe=(1, 1, 32),
+            activation="swiglu",
+            activation_clamp=swiglu_limit,
+            fast_math=True,
+        )
+    elif shared_weights is not None:
+        shared_l1_weights, shared_l2_weights = shared_weights
+        deep_gemm.fp8_mega_moe_with_shared(
+            y,
+            moe.experts.mega_l1_weights,
+            moe.experts.mega_l2_weights,
+            shared_l1_weights,
+            shared_l2_weights,
+            buf,
+            recipe=(128, 128, 128),
             activation="swiglu",
             activation_clamp=swiglu_limit,
             fast_math=True,
